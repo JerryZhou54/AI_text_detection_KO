@@ -82,11 +82,11 @@ def main(checkpoint, port=8080, device='cuda' if torch.cuda.is_available() else 
     print(f'Loading checkpoint from {checkpoint}')
     data = torch.load(checkpoint, map_location='cpu')
 
-    model_name = 'roberta-large' if data['args']['large'] else 'roberta-base'
+    model_name = 'weizhou03/roberta-old-AI-detector'
     model = RobertaForSequenceClassification.from_pretrained(model_name)
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
 
-    model.load_state_dict(data['model_state_dict'])
+    # model.load_state_dict(data['model_state_dict'])
     model.eval()
 
     print(f'Starting HTTP server on port {port}', file=sys.stderr)
