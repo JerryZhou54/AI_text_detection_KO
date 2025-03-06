@@ -56,7 +56,7 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
         fake_train = sum([corpus.train for corpus in fake_corpora], [])
         fake_valid = sum([corpus.valid for corpus in fake_corpora], [])
     else:
-        fake_corpus = Corpus(fake_dataset, data_dir=data_dir)
+        fake_corpus = Corpus(fake_dataset, data_dir=data_dir, skip_train=True)
 
         real_train, real_valid = real_corpus.train, real_corpus.valid
         fake_train, fake_valid = fake_corpus.train, fake_corpus.valid
@@ -64,14 +64,11 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
     Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
 
     min_sequence_length = 10 if random_sequence_length else None
-    train_dataset = EncodedDataset(real_train, fake_train, tokenizer, max_sequence_length, min_sequence_length,
-                                   epoch_size, token_dropout, seed)
-    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
 
     validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
-    validation_loader = DataLoader(validation_dataset, batch_size=1, sampler=Sampler(validation_dataset))
+    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, sampler=Sampler(validation_dataset))
 
-    return train_loader, validation_loader
+    return None, validation_loader
 
 
 def accuracy_sum(logits, labels):
@@ -91,7 +88,7 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
     validation_loss = 0
 
     records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}',
-                                                               disable=dist.is_available() and dist.get_rank() > 0)]
+                                                               disable=False)]
     records = [[records[v * len(loader) + i] for v in range(votes)] for i in range(len(loader))]
 
     with tqdm(records, desc=desc, disable=distributed() and dist.get_rank() > 0) as loop, torch.no_grad():
@@ -103,9 +100,9 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
                 texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
                 batch_size = texts.shape[0]
 
-                loss, logits = model(texts, attention_mask=masks, labels=labels)
-                losses.append(loss)
-                logit_votes.append(logits)
+                output = model(texts, attention_mask=masks, labels=labels)
+                losses.append(output.loss)
+                logit_votes.append(output.logits)
 
             loss = torch.stack(losses).mean(dim=0)
             logits = torch.stack(logit_votes).mean(dim=0)
@@ -158,7 +155,7 @@ def run(device=None,
     if distributed() and rank > 0:
         dist.barrier()
 
-    model_name = 'roberta-large' if large else 'weizhou03/roberta-old-AI-detector'
+    model_name = 'roberta-large' if large else '/home/hice1/wzhou322/scratch/roberta-old-AI-detector'
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
@@ -180,10 +177,15 @@ def run(device=None,
 
     validation_metrics = validate(model, device, validation_loader)
 
-    combined_metrics = _all_reduce_dict({**validation_metrics}, device)
+    if dist.is_available() and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        combined_metrics = _all_reduce_dict({**validation_metrics}, device)
 
-    combined_metrics["validation/accuracy"] /= combined_metrics["validation/epoch_size"]
-    combined_metrics["validation/loss"] /= combined_metrics["validation/epoch_size"]
+        combined_metrics["validation/accuracy"] /= combined_metrics["validation/epoch_size"]
+        combined_metrics["validation/loss"] /= combined_metrics["validation/epoch_size"]
+    # print(combined_metrics)
+    validation_metrics["validation/accuracy"] /= validation_metrics["validation/epoch_size"]
+    validation_metrics["validation/loss"] /= validation_metrics["validation/epoch_size"]
+    print(validation_metrics)
 
 
 if __name__ == '__main__':

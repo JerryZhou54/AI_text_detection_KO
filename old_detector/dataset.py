@@ -1,4 +1,5 @@
 import json
+import os
 import numpy as np
 from typing import List
 
@@ -28,7 +29,7 @@ class Corpus:
     def __init__(self, name, data_dir='data', skip_train=False):
         self.name = name
         self.train = load_texts_from_csv(f'{data_dir}/{name}.train.csv') if not skip_train else None
-        self.test = load_texts_from_csv(f'{data_dir}/{name}.test.csv')
+        self.test = load_texts_from_csv(os.path.join(data_dir, f'{name}.test.csv'))
         self.valid = load_texts_from_csv(f'{data_dir}/{name}.valid.csv')
         if skip_train:
             self.valid.extend(self.test)
@@ -65,9 +66,9 @@ class EncodedDataset(Dataset):
         tokens = self.tokenizer.encode(text)
 
         if self.max_sequence_length is None:
-            tokens = tokens[:self.tokenizer.max_len - 2]
+            tokens = tokens[:self.tokenizer.model_max_length - 2]
         else:
-            output_length = min(len(tokens), self.max_sequence_length)
+            output_length = min(len(tokens), self.model_max_length)
             if self.min_sequence_length:
                 output_length = self.random.randint(min(self.min_sequence_length, len(tokens)), output_length + 1)
             start_index = 0 if len(tokens) <= output_length else self.random.randint(0, len(tokens) - output_length + 1)
