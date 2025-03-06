@@ -10,23 +10,28 @@ from transformers import PreTrainedTokenizer
 from download import download
 
 
-def load_texts(data_file, expected_size=None):
+import csv
+from tqdm import tqdm
+
+def load_texts_from_csv(csv_file):
     texts = []
 
-    for line in tqdm(open(data_file), total=expected_size, desc=f'Loading {data_file}'):
-        texts.append(json.loads(line)['text'])
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in tqdm(reader, desc=f'Loading {csv_file}'):
+            texts.append(row['text'])  # Assuming the CSV has a column named 'text'
 
     return texts
 
 
 class Corpus:
     def __init__(self, name, data_dir='data', skip_train=False):
-        download(name, data_dir=data_dir)
         self.name = name
-        self.train = load_texts(f'{data_dir}/{name}.train.jsonl', expected_size=250000) if not skip_train else None
-        self.test = load_texts(f'{data_dir}/{name}.test.jsonl', expected_size=5000)
-        self.valid = load_texts(f'{data_dir}/{name}.valid.jsonl', expected_size=5000)
-
+        self.train = load_texts_from_csv(f'{data_dir}/{name}.train.csv') if not skip_train else None
+        self.test = load_texts_from_csv(f'{data_dir}/{name}.test.csv')
+        self.valid = load_texts_from_csv(f'{data_dir}/{name}.valid.csv')
+        if skip_train:
+            self.valid.extend(self.test)
 
 class EncodedDataset(Dataset):
     def __init__(self, real_texts: List[str], fake_texts: List[str], tokenizer: PreTrainedTokenizer,
