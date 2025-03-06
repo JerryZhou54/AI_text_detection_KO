@@ -4,7 +4,7 @@ import requests
 import torch.distributed as dist
 from tqdm import tqdm
 
-from .utils import distributed
+from utils import distributed
 
 ALL_DATASETS = [
     'webtext',

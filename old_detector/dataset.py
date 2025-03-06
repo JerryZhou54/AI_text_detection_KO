@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from .download import download
+from download import download
 
 
 def load_texts(data_file, expected_size=None):
