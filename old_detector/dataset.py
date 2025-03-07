@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from download import download
+import pandas as pd
 
 
 import csv
@@ -62,6 +63,59 @@ class EncodedDataset(Dataset):
             else:
                 text = self.fake_texts[index - len(self.real_texts)]
                 label = 0
+
+        tokens = self.tokenizer.encode(text)
+
+        if self.max_sequence_length is None:
+            tokens = tokens[:self.tokenizer.model_max_length - 2]
+        else:
+            output_length = min(len(tokens), self.model_max_length)
+            if self.min_sequence_length:
+                output_length = self.random.randint(min(self.min_sequence_length, len(tokens)), output_length + 1)
+            start_index = 0 if len(tokens) <= output_length else self.random.randint(0, len(tokens) - output_length + 1)
+            end_index = start_index + output_length
+            tokens = tokens[start_index:end_index]
+
+        if self.token_dropout:
+            dropout_mask = self.random.binomial(1, self.token_dropout, len(tokens)).astype(np.bool)
+            tokens = np.array(tokens)
+            tokens[dropout_mask] = self.tokenizer.unk_token_id
+            tokens = tokens.tolist()
+
+        if self.max_sequence_length is None or len(tokens) == self.max_sequence_length:
+            mask = torch.ones(len(tokens) + 2)
+            return torch.tensor([self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]), mask, label
+
+        padding = [self.tokenizer.pad_token_id] * (self.max_sequence_length - len(tokens))
+        tokens = torch.tensor([self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id] + padding)
+        mask = torch.ones(tokens.shape[0])
+        mask[-len(padding):] = 0
+        return tokens, mask, label
+    
+class TuringBenchDataset(Dataset):
+    def __init__(self, csv_file, tokenizer: PreTrainedTokenizer,
+                 max_sequence_length: int = None, min_sequence_length: int = None, epoch_size: int = None,
+                 token_dropout: float = None, seed: int = None):
+        self.data = pd.read_csv(csv_file)
+        self.tokenizer = tokenizer
+        self.max_sequence_length = max_sequence_length
+        self.min_sequence_length = min_sequence_length
+        self.epoch_size = epoch_size
+        self.token_dropout = token_dropout
+        self.random = np.random.RandomState(seed)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        if self.epoch_size is not None:
+            label = self.random.randint(2)
+            texts = [self.fake_texts, self.real_texts][label]
+            text = texts[self.random.randint(len(texts))]
+        else:
+            text = self.data.iloc[index]["Generation"]
+            label = self.data.iloc[index]["label"]
+            label = 'human' in label
 
         tokens = self.tokenizer.encode(text)
 
