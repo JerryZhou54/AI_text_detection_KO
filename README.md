@@ -12,7 +12,7 @@ The current best RoBERTa AI text detector checkpoint (trained on both GPT2 outpu
 - Add `old_detector/eval.py` to separate the training logic and evaluation logic.
 - Add the `TuringBenchDataset` class in `old_detector/dataset.py` which prepares the data from TuringBench dataset for future training.
 
-## Progress made for Progress Report 2
+## Progress made for Progress Report 3
 - Update `old_detector/train.py` to support finetuning on the TuringBench dataset
 - Add `run_old_train.sh` script to automatically finetune the model on the TuringBench dataset
 - Add `train.ipynb` which contains the execution results of finetunning the model on the TuringBench dataset
