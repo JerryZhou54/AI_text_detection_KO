@@ -70,6 +70,16 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
 
     return None, validation_loader
 
+def load_turing_datasets(val_dir, tokenizer, batch_size, 
+    max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
+    Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
+
+    min_sequence_length = 10 if random_sequence_length else None
+
+    validation_dataset = TuringBenchDataset(val_dir, tokenizer)
+    validation_loader = DataLoader(validation_dataset, batch_size=1,sampler=Sampler(validation_dataset))
+
+    return validation_loader
 
 def accuracy_sum(logits, labels):
     if list(logits.shape) == list(labels.shape) + [2]:
@@ -142,6 +152,7 @@ def run(device=None,
         fake_dataset='xl-1542M-nucleus',
         token_dropout=None,
         large=False,
+        ckpt=None,
         **kwargs):
     args = locals()
     rank, world_size = setup_distributed()
@@ -159,9 +170,13 @@ def run(device=None,
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
+    if ckpt is not None:
+        print("Loading from checkpoint")
+        state_dict = torch.load(ckpt)["model_state_dict"]
+        model.load_state_dict(state_dict)
 
     if rank == 0:
-        summary(model)
+        # summary(model)
         if distributed():
             dist.barrier()
 
@@ -200,6 +215,7 @@ if __name__ == '__main__':
     parser.add_argument('--real-dataset', type=str, default='webtext')
     parser.add_argument('--fake-dataset', type=str, default='xl-1542M-k40')
     parser.add_argument('--token-dropout', type=float, default=None)
+    parser.add_argument('--ckpt', type=str, default=None)
 
     parser.add_argument('--large', action='store_true', help='use the roberta-large model instead of roberta-base')
     args = parser.parse_args()

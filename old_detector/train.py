@@ -16,9 +16,8 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
 from tqdm import tqdm
 from transformers import *
 
-from .dataset import Corpus, EncodedDataset
-from .download import download
-from .utils import summary, distributed
+from dataset import Corpus, EncodedDataset, TuringBenchDataset
+from utils import summary, distributed
 
 
 def setup_distributed(port=29500):
@@ -76,10 +75,23 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
     train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
 
     validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
-    validation_loader = DataLoader(validation_dataset, batch_size=1, sampler=Sampler(validation_dataset))
+    validation_loader = DataLoader(validation_dataset, batch_size=1,sampler=Sampler(validation_dataset))
 
     return train_loader, validation_loader
 
+def load_turing_datasets(train_dir, val_dir, tokenizer, batch_size, 
+    max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
+    Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
+
+    min_sequence_length = 10 if random_sequence_length else None
+    train_dataset = TuringBenchDataset(train_dir, tokenizer, max_sequence_length, min_sequence_length,
+                                   epoch_size, token_dropout, seed)
+    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
+
+    validation_dataset = TuringBenchDataset(val_dir, tokenizer)
+    validation_loader = DataLoader(validation_dataset, batch_size=1,sampler=Sampler(validation_dataset))
+
+    return train_loader, validation_loader
 
 def accuracy_sum(logits, labels):
     if list(logits.shape) == list(labels.shape) + [2]:
@@ -97,6 +109,9 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
     train_accuracy = 0
     train_epoch_size = 0
     train_loss = 0
+    
+    train_accs = []
+    train_losses = []
 
     with tqdm(loader, desc=desc, disable=distributed() and dist.get_rank() > 0) as loop:
         for texts, masks, labels in loop:
@@ -105,7 +120,7 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
             batch_size = texts.shape[0]
 
             optimizer.zero_grad()
-            loss, logits = model(texts, attention_mask=masks, labels=labels)
+            loss, logits = model(texts, attention_mask=masks, labels=labels, return_dict=False)
             loss.backward()
             optimizer.step()
 
@@ -115,11 +130,15 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
             train_loss += loss.item() * batch_size
 
             loop.set_postfix(loss=loss.item(), acc=train_accuracy / train_epoch_size)
+            train_accs.append(batch_accuracy / batch_size)
+            train_losses.append(loss.item())
 
     return {
         "train/accuracy": train_accuracy,
         "train/epoch_size": train_epoch_size,
-        "train/loss": train_loss
+        "train/loss": train_loss,
+        "train_losses": torch.tensor(train_losses),
+        "train_accs": torch.tensor(train_accs)
     }
 
 
@@ -131,7 +150,7 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
     validation_loss = 0
 
     records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}',
-                                                               disable=dist.is_available() and dist.get_rank() > 0)]
+                                                               disable=False)]
     records = [[records[v * len(loader) + i] for v in range(votes)] for i in range(len(loader))]
 
     with tqdm(records, desc=desc, disable=distributed() and dist.get_rank() > 0) as loop, torch.no_grad():
@@ -143,7 +162,7 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
                 texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
                 batch_size = texts.shape[0]
 
-                loss, logits = model(texts, attention_mask=masks, labels=labels)
+                loss, logits = model(texts, attention_mask=masks, labels=labels, return_dict=False)
                 losses.append(loss)
                 logit_votes.append(logits)
 
@@ -201,20 +220,32 @@ def run(max_epochs=None,
     if distributed() and rank > 0:
         dist.barrier()
 
-    model_name = 'roberta-large' if large else 'roberta-base'
+    model_name = 'roberta-large' if large else '/home/hice1/wzhou322/scratch/roberta-old-AI-detector'
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
+    for name, param in model.named_parameters():
+        if "classifier" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    print(sum(p.numel() for p in model.parameters()))
 
     if rank == 0:
-        summary(model)
+        # summary(model)
         if distributed():
             dist.barrier()
 
     if world_size > 1:
         model = DistributedDataParallel(model, [rank], output_device=rank, find_unused_parameters=True)
 
-    train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
+    # train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
+    #                                                 max_sequence_length, random_sequence_length, epoch_size,
+    #                                                 token_dropout, seed)
+    train_dir = os.path.join(data_dir, 'train.csv')
+    val_dir = os.path.join(data_dir, 'valid.csv')
+    train_loader, validation_loader = load_turing_datasets(train_dir, val_dir, tokenizer, batch_size,
                                                     max_sequence_length, random_sequence_length, epoch_size,
                                                     token_dropout, seed)
 
@@ -234,21 +265,33 @@ def run(max_epochs=None,
             validation_loader.sampler.set_epoch(epoch)
 
         train_metrics = train(model, optimizer, device, train_loader, f'Epoch {epoch}')
+        torch.save(train_metrics["train_losses"], "train_losses.pt")
+        torch.save(train_metrics["train_accs"], "train_accs.pt")
+        train_metrics.pop("train_losses")
+        train_metrics.pop("train_accs")
         validation_metrics = validate(model, device, validation_loader)
 
-        combined_metrics = _all_reduce_dict({**validation_metrics, **train_metrics}, device)
+        # combined_metrics = _all_reduce_dict({**validation_metrics, **train_metrics}, device)
 
-        combined_metrics["train/accuracy"] /= combined_metrics["train/epoch_size"]
-        combined_metrics["train/loss"] /= combined_metrics["train/epoch_size"]
-        combined_metrics["validation/accuracy"] /= combined_metrics["validation/epoch_size"]
-        combined_metrics["validation/loss"] /= combined_metrics["validation/epoch_size"]
+        # combined_metrics["train/accuracy"] /= combined_metrics["train/epoch_size"]
+        # combined_metrics["train/loss"] /= combined_metrics["train/epoch_size"]
+        # combined_metrics["validation/accuracy"] /= combined_metrics["validation/epoch_size"]
+        # combined_metrics["validation/loss"] /= combined_metrics["validation/epoch_size"]
+
+        train_metrics["train/accuracy"] /= train_metrics["train/epoch_size"]
+        train_metrics["train/loss"] /= train_metrics["train/epoch_size"]
+        validation_metrics["validation/accuracy"] /= validation_metrics["validation/epoch_size"]
+        validation_metrics["validation/loss"] /= validation_metrics["validation/epoch_size"]
+
+        print(train_metrics)
+        print(validation_metrics)
 
         if rank == 0:
-            for key, value in combined_metrics.items():
-                writer.add_scalar(key, value, global_step=epoch)
+            # for key, value in combined_metrics.items():
+            #     writer.add_scalar(key, value, global_step=epoch)
 
-            if combined_metrics["validation/accuracy"] > best_validation_accuracy:
-                best_validation_accuracy = combined_metrics["validation/accuracy"]
+            if validation_metrics["validation/accuracy"] > best_validation_accuracy:
+                best_validation_accuracy = validation_metrics["validation/accuracy"]
 
                 model_to_save = model.module if hasattr(model, 'module') else model
                 torch.save(dict(
@@ -267,7 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-epochs', type=int, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--batch-size', type=int, default=24)
-    parser.add_argument('--max-sequence-length', type=int, default=128)
+    parser.add_argument('--max-sequence-length', type=int, default=512)
     parser.add_argument('--random-sequence-length', action='store_true')
     parser.add_argument('--epoch-size', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)

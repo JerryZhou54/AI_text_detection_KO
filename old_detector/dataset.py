@@ -64,7 +64,7 @@ class EncodedDataset(Dataset):
                 text = self.fake_texts[index - len(self.real_texts)]
                 label = 0
 
-        tokens = self.tokenizer.encode(text)
+        tokens = self.tokenizer.encode(text, truncation=True)
 
         if self.max_sequence_length is None:
             tokens = tokens[:self.tokenizer.model_max_length - 2]
@@ -96,7 +96,10 @@ class TuringBenchDataset(Dataset):
     def __init__(self, csv_file, tokenizer: PreTrainedTokenizer,
                  max_sequence_length: int = None, min_sequence_length: int = None, epoch_size: int = None,
                  token_dropout: float = None, seed: int = None):
-        self.data = pd.read_csv(csv_file)
+        exclude_labels = ['gpt2_pytorch', 'pplm_gpt2', 'gpt2_small', 'gpt2_large', 'gpt2_medium', 'gpt2_xl']
+        df = pd.read_csv(csv_file)
+        self.data = df[~df['label'].isin(exclude_labels)]
+        # self.data = df
         self.tokenizer = tokenizer
         self.max_sequence_length = max_sequence_length
         self.min_sequence_length = min_sequence_length
@@ -108,21 +111,16 @@ class TuringBenchDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        if self.epoch_size is not None:
-            label = self.random.randint(2)
-            texts = [self.fake_texts, self.real_texts][label]
-            text = texts[self.random.randint(len(texts))]
-        else:
-            text = self.data.iloc[index]["Generation"]
-            label = self.data.iloc[index]["label"]
-            label = 'human' in label
+        text = self.data.iloc[index]["Generation"]
+        label = self.data.iloc[index]["label"]
+        label = int('human' in label)
 
-        tokens = self.tokenizer.encode(text)
+        tokens = self.tokenizer.encode(text, truncation=True)
 
         if self.max_sequence_length is None:
             tokens = tokens[:self.tokenizer.model_max_length - 2]
         else:
-            output_length = min(len(tokens), self.model_max_length)
+            output_length = min(len(tokens), self.max_sequence_length)
             if self.min_sequence_length:
                 output_length = self.random.randint(min(self.min_sequence_length, len(tokens)), output_length + 1)
             start_index = 0 if len(tokens) <= output_length else self.random.randint(0, len(tokens) - output_length + 1)
