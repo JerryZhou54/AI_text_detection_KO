@@ -2,6 +2,7 @@
 
 Check out `old_detector` to see more details.
 
+The RoBERTa AI text detector that is only trained on the GPT2 output dataset can be found [here](https://huggingface.co/weizhou03/roberta-old-AI-detector)
 The current best RoBERTa AI text detector checkpoint (trained on both GPT2 output dataset and TuringBench dataset) can be found [here](https://drive.google.com/file/d/1nhLOxHZhNOoFhVy06icKT4mjws8a8ODC/view?usp=sharing)
 
 ## Progress made for Progress Report 2
