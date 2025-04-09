@@ -42,7 +42,8 @@ def setup_distributed(port=29500):
 
 def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
                   max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
-    real_corpus = Corpus(real_dataset, data_dir=data_dir, skip_train=True)
+    if real_dataset != "":
+        real_corpus = Corpus(real_dataset, data_dir=data_dir, skip_train=True)
 
     if fake_dataset == "TWO":
         real_train, real_valid = real_corpus.train * 2, real_corpus.valid * 2
@@ -57,15 +58,17 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
         fake_valid = sum([corpus.valid for corpus in fake_corpora], [])
     else:
         fake_corpus = Corpus(fake_dataset, data_dir=data_dir, skip_train=True)
-
-        real_train, real_valid = real_corpus.train, real_corpus.valid
+        if real_dataset != "":
+            real_train, real_valid = real_corpus.train, real_corpus.valid
         fake_train, fake_valid = fake_corpus.train, fake_corpus.valid
 
     Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
 
     min_sequence_length = 10 if random_sequence_length else None
-
-    validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
+    if real_dataset != "":
+        validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
+    else:
+        validation_dataset = EncodedDataset([], fake_valid, tokenizer)
     validation_loader = DataLoader(validation_dataset, batch_size=batch_size, sampler=Sampler(validation_dataset))
 
     return None, validation_loader
@@ -212,7 +215,7 @@ if __name__ == '__main__':
     parser.add_argument('--random-sequence-length', action='store_true')
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--data-dir', type=str, default='data')
-    parser.add_argument('--real-dataset', type=str, default='webtext')
+    parser.add_argument('--real-dataset', type=str, default='')
     parser.add_argument('--fake-dataset', type=str, default='xl-1542M-k40')
     parser.add_argument('--token-dropout', type=float, default=None)
     parser.add_argument('--ckpt', type=str, default=None)
