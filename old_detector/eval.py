@@ -16,10 +16,11 @@ from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
 from tqdm import tqdm
 from transformers import *
 
-from dataset import Corpus, EncodedDataset
+from dataset import Corpus, EncodedDataset, TuringBenchDataset
 from download import download
 from utils import summary, distributed
 
+from sklearn.metrics import precision_recall_fscore_support
 
 def setup_distributed(port=29500):
     if not dist.is_available() or not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
@@ -39,6 +40,16 @@ def setup_distributed(port=29500):
     dist.init_process_group(backend="nccl", init_method="env://")
     return dist.get_rank(), dist.get_world_size()
 
+def load_turing_datasets(val_dir, tokenizer, batch_size, 
+    max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
+    Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
+
+    min_sequence_length = 10 if random_sequence_length else None
+
+    validation_dataset = TuringBenchDataset(val_dir, tokenizer)
+    validation_loader = DataLoader(validation_dataset, batch_size=1,sampler=Sampler(validation_dataset))
+
+    return validation_loader
 
 def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
                   max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
@@ -91,7 +102,7 @@ def accuracy_sum(logits, labels):
     else:
         classification = (logits > 0).long().flatten()
     assert classification.shape == labels.shape
-    return (classification == labels).float().sum().item()
+    return (classification == labels).float().sum().item(), classification
 
 def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='Validation'):
     model.eval()
@@ -99,6 +110,9 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
     validation_accuracy = 0
     validation_epoch_size = 0
     validation_loss = 0
+
+    all_preds = []
+    all_labels = []
 
     records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}',
                                                                disable=False)]
@@ -120,17 +134,31 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
             loss = torch.stack(losses).mean(dim=0)
             logits = torch.stack(logit_votes).mean(dim=0)
 
-            batch_accuracy = accuracy_sum(logits, labels)
+            batch_accuracy, preds = accuracy_sum(logits, labels)
             validation_accuracy += batch_accuracy
             validation_epoch_size += batch_size
             validation_loss += loss.item() * batch_size
 
+            # Save labels and preds for metric computation
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
             loop.set_postfix(loss=loss.item(), acc=validation_accuracy / validation_epoch_size)
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='binary'
+    )
+
+    print(all_preds.count(1))
+    print(all_preds.count(0))
 
     return {
         "validation/accuracy": validation_accuracy,
         "validation/epoch_size": validation_epoch_size,
-        "validation/loss": validation_loss
+        "validation/loss": validation_loss,
+        "validation/precision": precision,
+        "validation/recall": recall,
+        "validation/f1": f1,
     }
 
 
@@ -186,9 +214,10 @@ def run(device=None,
     if world_size > 1:
         model = DistributedDataParallel(model, [rank], output_device=rank, find_unused_parameters=True)
 
-    _, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                                                    max_sequence_length, random_sequence_length, epoch_size,
-                                                    token_dropout, seed)
+    # val_dir = os.path.join(data_dir, 'valid.csv')
+    # validation_loader = load_turing_datasets(val_dir, tokenizer,batch_size, max_sequence_length, random_sequence_length, epoch_size, token_dropout, seed)
+
+    _, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size, max_sequence_length, random_sequence_length, epoch_size, token_dropout, seed)
 
     logdir = os.environ.get("OPENAI_LOGDIR", "logs")
     os.makedirs(logdir, exist_ok=True)

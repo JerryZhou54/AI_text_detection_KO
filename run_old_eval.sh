@@ -6,4 +6,4 @@ python old_detector/eval.py \
     --real-dataset $REAL_DATASET \
     --fake-dataset $FAKE_DATASET \
     --batch-size 1 \
-    --ckpt /home/hice1/wzhou322/scratch/AI_text_detection_KO/logs/best-model.pt
+    --ckpt /home/hice1/wzhou322/scratch/AI_text_detection_KO/design3.pt

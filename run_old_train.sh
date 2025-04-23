@@ -1,3 +1,4 @@
+# Train on TuringBench dataset
 python old_detector/train.py \
     --max-epochs 1 \
     --batch-size 64 \

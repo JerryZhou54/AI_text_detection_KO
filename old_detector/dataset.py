@@ -15,23 +15,25 @@ import pandas as pd
 import csv
 from tqdm import tqdm
 
-def load_texts_from_csv(csv_file):
+def load_texts_from_csv(csv_file, max_len=None):
     texts = []
 
     with open(csv_file, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        for row in tqdm(reader, desc=f'Loading {csv_file}'):
+        for i, row in enumerate(tqdm(reader, desc=f'Loading {csv_file}')):
+            if max_len is not None and i > max_len:
+                break
             texts.append(row['text'])  # Assuming the CSV has a column named 'text'
 
     return texts
 
 
 class Corpus:
-    def __init__(self, name, data_dir='data', skip_train=False):
+    def __init__(self, name, data_dir='data', skip_train=False, max_train_len=None, max_valid_len=None):
         self.name = name
-        self.train = load_texts_from_csv(f'{data_dir}/{name}.train.csv') if not skip_train else None
-        self.test = load_texts_from_csv(os.path.join(data_dir, f'{name}.test.csv'))
-        self.valid = load_texts_from_csv(f'{data_dir}/{name}.valid.csv')
+        self.train = load_texts_from_csv(f'{data_dir}/{name}.train.csv', max_train_len) if not skip_train else None
+        self.test = load_texts_from_csv(os.path.join(data_dir, f'{name}.test.csv'), max_valid_len) if os.path.isfile(os.path.join(data_dir, f'{name}.test.csv')) else []
+        self.valid = load_texts_from_csv(f'{data_dir}/{name}.valid.csv', max_valid_len)
         if skip_train:
             self.valid.extend(self.test)
 
@@ -69,7 +71,7 @@ class EncodedDataset(Dataset):
         if self.max_sequence_length is None:
             tokens = tokens[:self.tokenizer.model_max_length - 2]
         else:
-            output_length = min(len(tokens), self.model_max_length)
+            output_length = min(len(tokens), self.max_sequence_length)
             if self.min_sequence_length:
                 output_length = self.random.randint(min(self.min_sequence_length, len(tokens)), output_length + 1)
             start_index = 0 if len(tokens) <= output_length else self.random.randint(0, len(tokens) - output_length + 1)

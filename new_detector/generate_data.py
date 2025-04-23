@@ -7,15 +7,15 @@ from multiprocessing import Pool, cpu_count, get_context
 import os
 
 # ====== Configuration ======
-INPUT_CSV = '/home/hice1/wzhou322/scratch/gpt2-output-data/webtext.valid.csv'
-OUTPUT_CSV = '/home/hice1/wzhou322/scratch/gpt2-output-data/gpt-4o-mini.webtext.valid.csv'
+INPUT_CSV = '/home/hice1/wzhou322/scratch/gpt2-output-data/webtext.train.csv'
+OUTPUT_CSV = '/home/hice1/wzhou322/scratch/gpt2-output-data/gpt-4o-mini.webtext.train.csv'
 TEXT_COLUMN = 'text'
 API_MODEL = 'gpt-4o-mini'
 MAX_RETRIES = 2
 DELAY_BETWEEN_REQUESTS = 0  # seconds
 FLUSH_EVERY = 50
 NUM_WORKERS = 16
-OPENAI_API_KEY = ''
+OPENAI_API_KEY = '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'
 client = OpenAI(
     api_key=OPENAI_API_KEY,
 )

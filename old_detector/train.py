@@ -19,6 +19,9 @@ from transformers import *
 from dataset import Corpus, EncodedDataset, TuringBenchDataset
 from utils import summary, distributed
 
+from sklearn.metrics import precision_recall_fscore_support
+from fvcore.nn import FlopCountAnalysis
+from typing import Tuple
 
 def setup_distributed(port=29500):
     if not dist.is_available() or not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
@@ -40,16 +43,7 @@ def setup_distributed(port=29500):
 
 
 def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                  max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
-    if fake_dataset == 'TWO':
-        download(real_dataset, 'xl-1542M', 'xl-1542M-nucleus', data_dir=data_dir)
-    elif fake_dataset == 'THREE':
-        download(real_dataset, 'xl-1542M', 'xl-1542M-k40', 'xl-1542M-nucleus', data_dir=data_dir)
-    else:
-        download(real_dataset, fake_dataset, data_dir=data_dir)
-
-    real_corpus = Corpus(real_dataset, data_dir=data_dir)
-
+                  max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None, extra_fake_dataset=None):
     if fake_dataset == "TWO":
         real_train, real_valid = real_corpus.train * 2, real_corpus.valid * 2
         fake_corpora = [Corpus(name, data_dir=data_dir) for name in ['xl-1542M', 'xl-1542M-nucleus']]
@@ -63,18 +57,35 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
         fake_valid = sum([corpus.valid for corpus in fake_corpora], [])
     else:
         fake_corpus = Corpus(fake_dataset, data_dir=data_dir)
-
-        real_train, real_valid = real_corpus.train, real_corpus.valid
         fake_train, fake_valid = fake_corpus.train, fake_corpus.valid
+
+        if extra_fake_dataset is not None:
+            fake_train_len, fake_valid_len = len(fake_train), len(fake_valid)
+            extra_fake_corpus = Corpus(extra_fake_dataset, data_dir=data_dir, max_train_len=fake_train_len, max_valid_len=fake_valid_len)
+            extra_fake_train, extra_fake_valid = extra_fake_corpus.train, extra_fake_corpus.valid
+            fake_train.extend(extra_fake_train)
+            fake_valid.extend(extra_fake_valid)
+
+        if real_dataset != "":
+            fake_train_len, fake_valid_len = len(fake_train), len(fake_valid)
+            real_corpus = Corpus(real_dataset, data_dir=data_dir, max_train_len=fake_train_len, max_valid_len=fake_valid_len)
+            real_train, real_valid = real_corpus.train, real_corpus.valid
 
     Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
 
     min_sequence_length = 10 if random_sequence_length else None
-    train_dataset = EncodedDataset(real_train, fake_train, tokenizer, max_sequence_length, min_sequence_length,
-                                   epoch_size, token_dropout, seed)
-    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
+    if real_dataset != "":
+        train_dataset = EncodedDataset(real_train, fake_train, tokenizer, max_sequence_length, min_sequence_length,
+                                    epoch_size, token_dropout, seed)
+    else:
+        train_dataset = EncodedDataset([], fake_train, tokenizer, max_sequence_length, min_sequence_length,
+                                    epoch_size, token_dropout, seed)
+    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset))
 
-    validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
+    if real_dataset != "":
+        validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
+    else:
+        validation_dataset = EncodedDataset([], fake_valid, tokenizer)
     validation_loader = DataLoader(validation_dataset, batch_size=1,sampler=Sampler(validation_dataset))
 
     return train_loader, validation_loader
@@ -100,7 +111,7 @@ def accuracy_sum(logits, labels):
     else:
         classification = (logits > 0).long().flatten()
     assert classification.shape == labels.shape
-    return (classification == labels).float().sum().item()
+    return (classification == labels).float().sum().item(), classification
 
 
 def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Train'):
@@ -124,7 +135,7 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
             loss.backward()
             optimizer.step()
 
-            batch_accuracy = accuracy_sum(logits, labels)
+            batch_accuracy, _ = accuracy_sum(logits, labels)
             train_accuracy += batch_accuracy
             train_epoch_size += batch_size
             train_loss += loss.item() * batch_size
@@ -149,6 +160,9 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
     validation_epoch_size = 0
     validation_loss = 0
 
+    all_preds = []
+    all_labels = []
+
     records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}',
                                                                disable=False)]
     records = [[records[v * len(loader) + i] for v in range(votes)] for i in range(len(loader))]
@@ -169,10 +183,13 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
             loss = torch.stack(losses).mean(dim=0)
             logits = torch.stack(logit_votes).mean(dim=0)
 
-            batch_accuracy = accuracy_sum(logits, labels)
+            batch_accuracy, preds = accuracy_sum(logits, labels)
             validation_accuracy += batch_accuracy
             validation_epoch_size += batch_size
             validation_loss += loss.item() * batch_size
+
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
 
             loop.set_postfix(loss=loss.item(), acc=validation_accuracy / validation_epoch_size)
 
@@ -182,6 +199,32 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
         "validation/loss": validation_loss
     }
 
+def estimate_total_flops(
+    model: nn.Module,
+    input_size: Tuple[int],
+    N: int,
+    batch_size: int,
+    epochs: int,
+    trainable_ratio = 1
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    dummy_input = torch.randint(50265, (1, *input_size), device=device)
+    flops_forward = FlopCountAnalysis(model, dummy_input).total()
+
+    # In training: forward + backward + optimizer step
+    # Rule of thumb: backward ≈ 2x forward, optimizer ≈ 1x forward
+    flops_per_sample = flops_forward * (1 + 2 * trainable_ratio + 1 * trainable_ratio)  # total ≈ 4x forward flops
+
+    total_steps = (N * batch_size) * epochs
+    total_flops = flops_per_sample * batch_size * total_steps
+
+    print(f"FLOPs per sample (forward): {flops_forward:,.0f}")
+    print(f"FLOPs per sample (train step): {flops_per_sample:,.0f}")
+    print(f"Total training steps: {total_steps}")
+    print(f"Total TFLOPs for training: {total_flops/1e12:,.0f}")
+    return total_flops
 
 def _all_reduce_dict(d, device):
     # wrap in tensor and use reduce to gpu0 tensor
@@ -201,12 +244,14 @@ def run(max_epochs=None,
         epoch_size=None,
         seed=None,
         data_dir='data',
-        real_dataset='webtext',
+        real_dataset='',
         fake_dataset='xl-1542M-nucleus',
+        extra_fake_dataset=None,
         token_dropout=None,
         large=False,
         learning_rate=2e-5,
         weight_decay=0,
+        freeze_params=False,
         **kwargs):
     args = locals()
     rank, world_size = setup_distributed()
@@ -224,13 +269,16 @@ def run(max_epochs=None,
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
-    for name, param in model.named_parameters():
-        if "classifier" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
-    print(sum(p.numel() for p in model.parameters()))
+    
+    trainable_ratio = 1
+    if freeze_params:
+        for name, param in model.named_parameters():
+            if "classifier" in name or "11" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        trainable_ratio = sum(p.numel() for p in model.parameters() if p.requires_grad) / sum(p.numel() for p in model.parameters())
+        print("Trainable ratio: ", trainable_ratio)
 
     if rank == 0:
         # summary(model)
@@ -240,20 +288,20 @@ def run(max_epochs=None,
     if world_size > 1:
         model = DistributedDataParallel(model, [rank], output_device=rank, find_unused_parameters=True)
 
-    # train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
+    train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size, max_sequence_length, random_sequence_length, epoch_size, token_dropout, seed, extra_fake_dataset=extra_fake_dataset)
+    # train_dir = os.path.join(data_dir, 'train.csv')
+    # val_dir = os.path.join(data_dir, 'valid.csv')
+    # train_loader, validation_loader = load_turing_datasets(train_dir, val_dir, tokenizer, batch_size,
     #                                                 max_sequence_length, random_sequence_length, epoch_size,
     #                                                 token_dropout, seed)
-    train_dir = os.path.join(data_dir, 'train.csv')
-    val_dir = os.path.join(data_dir, 'valid.csv')
-    train_loader, validation_loader = load_turing_datasets(train_dir, val_dir, tokenizer, batch_size,
-                                                    max_sequence_length, random_sequence_length, epoch_size,
-                                                    token_dropout, seed)
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     epoch_loop = count(1) if max_epochs is None else range(1, max_epochs + 1)
 
     logdir = os.environ.get("OPENAI_LOGDIR", "logs")
     os.makedirs(logdir, exist_ok=True)
+
+    estimate_total_flops(model, input_size=(max_sequence_length,), N=len(train_loader), batch_size=batch_size, epochs=max_epochs, trainable_ratio=trainable_ratio)
 
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(logdir) if rank == 0 else None
@@ -315,13 +363,15 @@ if __name__ == '__main__':
     parser.add_argument('--epoch-size', type=int, default=None)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--data-dir', type=str, default='data')
-    parser.add_argument('--real-dataset', type=str, default='webtext')
+    parser.add_argument('--real-dataset', type=str, default='')
     parser.add_argument('--fake-dataset', type=str, default='xl-1542M-k40')
+    parser.add_argument('--extra-fake-dataset', type=str, default=None)
     parser.add_argument('--token-dropout', type=float, default=None)
 
     parser.add_argument('--large', action='store_true', help='use the roberta-large model instead of roberta-base')
     parser.add_argument('--learning-rate', type=float, default=2e-5)
     parser.add_argument('--weight-decay', type=float, default=0)
+    parser.add_argument('--freeze_params', action='store_true')
     args = parser.parse_args()
 
     nproc = int(subprocess.check_output([sys.executable, '-c', "import torch;"
